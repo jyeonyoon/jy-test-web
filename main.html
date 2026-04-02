@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <style>
+    input:disabled + span {
+        color: #aaa;
+    }
+     body {
+      margin: 0;
+    }
+    #remoteVideo {
+        width: 100%;
+        height: 100vh; /* vh 대신 % 사용 */
+        min-height: 200px; /* 안전하게 최소 높이 지정 */
+        background-color: black; /* 영역 확인용 */
+        object-fit: contain;
+        display: block; /* WebView에서 inline 요소로 처리되는 걸 방지 */
+    }
+    /* 오른쪽 위 작은 PiP 비디오 */
+    #localVideo {
+      position: absolute;
+      top: 20px;
+      right: 10px;
+      width: 200px;
+      height: 150px;
+      border: 2px solid white;
+      background: black;
+    }
+  </style>
+  <title>Main</title>
+  <base href="/cam_supabase/">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+
+  <h2>Main Page</h2>
+
+  <button id="sendBtn">Send Broadcast</button>
+  <button id="logoutBtn">Logout</button>
+
+  <div id="robotList"></div>
+  <button id="checkedOnline">상태 확인</button>
+  <button id="requestCall">통화 연결 요청</button>
+  <button id="connectOffer">연결 요청</button>
+  
+  <!-- 전체 화면 비디오 -->
+  <video id="remoteVideo" autoplay playsinline></video>
+  <!-- 오른쪽 위 PiP 비디오 -->
+  <video id="localVideo" autoplay playsinline muted></video>
+
+  <script>
+    let pc;
+    let localStream;
+    let targetId;
+
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+
+    async function startCamera() {
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+            localVideo.srcObject = localStream;
+        } catch (err) {
+            console.error("카메라 접근 실패:", err);
+        }
+    }
+
+    function createPeerConnection() {
+        if (pc) return pc;
+        pc = new RTCPeerConnection({
+            iceServers: [
+                { urls: "stun:stun.l.google.com:19302" }
+            ]
+        });
+        pc.onicecandidate = (event) => {
+            console.info("!!! onicecandidate");
+            if (event.candidate) {
+                console.log("onicecandidate=", event.candidate);
+                sendCandidateMessage(targetId, event.candidate);
+            } else {
+                console.error("onicecandidate= null", event);
+            }
+        };
+        pc.ontrack = (event) => {
+            console.log("트랙 수신!", event.track.kind); 
+            
+            let eventStream = event.streams[0];
+
+            // 1. 스트림 보정 (기존 코드 유지)
+            if (!eventStream || event.streams.length === 0) {
+                console.warn("스트림이 없어 새 스트림을 생성합니다.");
+                eventStream = new MediaStream();
+                eventStream.addTrack(event.track);
+            }
+
+            // 2. 비디오 태그에 스트림 연결
+            // if (remoteVideo.srcObject !== eventStream) {
+                remoteVideo.srcObject = eventStream;
+            // }
+
+            // 3. 오디오 트랙 전용 처리
+            if (event.track.kind === 'audio') {
+                console.log("오디오 트랙 활성화 시도");
+                
+                // 브라우저 정책: 사용자가 화면을 한 번이라도 클릭해야 소리가 들립니다.
+                // 처음엔 소리가 안 날 수 있으니 소거(muted)를 해제해줍니다.
+                remoteVideo.muted = false; 
+                
+                
+                // 만약 비디오 태그와 별개로 소리만 더 크게/따로 내고 싶다면 
+                // 여기서 new Audio()를 만들어 붙여도 됩니다 (선택사항)
+            }
+
+            // 4. 자동 재생 실행
+            remoteVideo.onloadedmetadata = () => {
+                remoteVideo.play().catch(e => {
+                    console.error("재생 차단됨. 사용자의 '클릭'이 필요합니다:", e);
+                    // 안내 문구 띄우기 예시:
+                    // document.getElementById('status').innerText = "화면을 클릭하면 소리가 들립니다!";
+                });
+                console.log("현재 볼륨 상태:", remoteVideo.volume, "뮤트 여부:", remoteVideo.muted);
+            };
+        };
+        pc.oniceconnectionstatechange = () => {
+            console.log("ice state = ", pc.iceConnectionState)
+            if (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed" || pc.iceConnectionState === "closed") {
+                // clear
+                if(pc) {
+                    pc.close();
+                    pc = null;
+                }
+                if(remoteVideo.srcObject) {
+                    remoteVideo.srcObject = null;
+                }
+                    
+                // re
+                if(localStream) {
+                    pc = createPeerConnection();
+
+                    localStream.getTracks().forEach(track => {
+                        pc.addTrack(track, localStream);
+                    });            
+                    console.error("closed and recreated peer connection");
+                }                
+            }
+        };
+        return pc;
+    }
+
+    window.addEventListener("DOMContentLoaded", async () => {
+        // init camera and connection
+        await startCamera();
+        if(localStream) {
+            pc = createPeerConnection();
+
+            localStream.getTracks().forEach(track => {
+                pc.addTrack(track, localStream);
+            });            
+        }
+    });
+
+    window.addEventListener('beforeunload', () => {
+        // 화면 종료시
+    });
+
+    // offer button
+    document.getElementById("connectOffer").onclick = async () => {
+        console.log("=== connectOffer ===")
+        const selected = getSelectedRobotId();
+        console.log("selected = ", selected);
+        if(selected) {
+            await createOfferAndSendMessage(selected);
+            // targetId = selected;
+
+            // if(targetId) {
+            //     const offer = await pc.createOffer();
+            //     await pc.setLocalDescription(offer);
+                
+            //     console.log("offer.sdp=", offer.sdp);
+            //     sendOfferMessage(targetId, offer.sdp);
+
+            //     // await waitForIce();
+            //     // sendOfferMessage(targetId, JSON.stringify(pc.localDescription));
+            // }
+        }
+    };
+
+    document.getElementById("requestCall").onclick = async () => {
+        console.log("=== requestCall ===")
+        const selected = getSelectedRobotId();
+        console.log("selected = ", selected);
+        if(selected) {
+            sendRequestMessage(selected);
+        }
+    }
+
+    async function createOfferAndSendMessage(target) {
+        targetId = target;
+        if(targetId) {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            
+            console.log("offer.sdp=", offer.sdp);
+            sendOfferMessage(targetId, offer.sdp);
+        }
+    }
+    
+    //
+    function onReceivedResponse(sender, command, message) {
+        // console.log("onReceivedResponse=", sender, command, message)
+    }
+    // 1. 함수를 async로 선언해야 내부에서 await를 쓸 수 있습니다.
+    window.addEventListener('webrtc-signal', async (e) => {
+        const { sender, message } = e.detail;
+        onReceivedWebRtcSignal(sender, message)
+    });
+    async function onReceivedWebRtcSignal(sender, message) {
+        // console.log("onReceivedWebRtcSignal=", sender, message);
+        const type = message.signal_type;
+    
+        if (type === "offer") {
+            // 로봇이 먼저 Offer를 보낸 경우 (로봇 -> 관리자)
+            // let finalSdp = message.sdp;
+            const sender = message.from;
+            if(!sender) {
+                console.error("sender == null");
+                return;
+            }
+            targetId = sender;
+
+            const remoteDesc = await getSafeSdp(message.sdp, 'offer');
+            await pc.setRemoteDescription(remoteDesc);
+            console.log("Remote Offer 설정 완료");
+
+            // 4. Answer 생성 및 Local Description 설정
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log("Local 설정 완료");
+
+            // 5. 시그널링 서버로 Answer 전송
+            sendAnswerMessage(targetId, pc.localDescription.sdp);
+
+            // 6. 대기 중인 Candidate 처리
+            drainCandidateQueue();
+
+        } else if (type === "answer") {
+         
+            const remoteDesc = await getSafeSdp(message.sdp, 'answer');
+
+            await pc.setRemoteDescription(remoteDesc);
+            console.log("Remote Answer 설정 완료");
+
+            drainCandidateQueue();
+
+        } else if (type === "candidate") {
+            const candData = message.candidate;
+            console.log("received candidate=", candData);
+            
+            // RemoteDescription이 아직 없다면 큐에 저장, 있다면 즉시 추가
+            if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+                console.error("addIceCandidate")
+                await addSafeIceCandidate(candData);
+            } else {
+                console.log("RemoteDescription이 없어 Candidate를 큐에 보관합니다.");
+                iceCandidateQueue.push(candData);
+            }
+        } else {
+            console.error("unknown signal=", message);
+        }
+    }
+
+    // Candidate 보관용 큐
+    let iceCandidateQueue = [];
+
+    async function addSafeIceCandidate(rawData) {
+        try {
+            const safeCand = getSafeIceCandidate(rawData);
+            await pc.addIceCandidate(safeCand);
+            console.log("addSafeIceCandidate:", safeCand.candidate || "null data (Empty)");
+        } catch (e) {
+            console.error("Error adding ice candidate", e);
+        }
+    }
+
+    function getSafeIceCandidate(rawData) {
+        // console.log("original:", rawData); 
+
+        let candidateObj = typeof rawData === 'string' 
+            ? { candidate: rawData, sdpMid: "0", sdpMLineIndex: 0 } 
+            : rawData;
+
+        // 방어 코드(kotiln의 candidate는 sdp가 기본값으로 되어 있었음)
+        if(!candidateObj.candidate && candidateObj.sdp) {
+            candidateObj = {
+                candidate: candidateObj.sdp,   // sdp -> candidate로
+                sdpMid: candidateObj.sdpMid,
+                sdpMLineIndex: candidateObj.sdpMLineIndex
+            }
+        }
+
+        // 데이터 검증
+        if (!candidateObj.candidate) {
+            console.error("candidateObj.candidate= null", rawData);
+            return null;
+        }
+
+        try {
+            const finalIceCandi = new RTCIceCandidate(candidateObj);
+            console.log("succeed @ create safe candidate", finalIceCandi.candidate);
+            return finalIceCandi;
+        } catch (e) {
+            console.error("failed @ create safe candidate", e);
+            return null;
+        }
+    }
+
+    async function drainCandidateQueue() {
+        console.log("drainCandidateQueue:", pc.signalingState);
+
+        for (const cand of iceCandidateQueue) {
+            try {
+                if (pc.remoteDescription && pc.remoteDescription.type) {
+                    await addSafeIceCandidate(cand);
+                } else {
+                    console.warn("remoteDescription = null");
+                }
+            } catch (e) {
+                console.error("failed @ add ice candidate", e);
+            }
+        }
+        iceCandidateQueue = [];
+    }
+
+    function fixSdpForChrome(sdp) { // .trim().replace(/^"|"$/g, '');
+        return sdp.split('\n')
+            .map(line => line.trim()) // 1. 라인 앞뒤의 모든 보이지 않는 공백 제거
+            .filter(line => line.length > 0) // 2. 빈 줄 제거
+            .map(line => {
+                // 3. ssrc 라인의 msid 부분에 공백이 여러 개일 경우 하나로 강제 치환
+                if (line.startsWith("a=ssrc:") && line.includes("msid:")) {
+                    return line.replace(/\s+/g, ' '); 
+                }
+                return line;
+            })
+            .join('\r\n') + '\r\n'; // 4. 반드시 CRLF로 합치기
+    }
+
+    /**
+     * 어떤 형태의 데이터가 들어와도 안전한 SDP 객체로 변환합니다.
+     * @param {string|object} input - 서버에서 받은 데이터 (JSON string, Object, 또는 SDP string)
+     * @param {string} type - 'offer' 또는 'answer'
+     */
+    async function getSafeSdp(input, type) {
+        try {
+            let sdpString = "";
+
+            // 1. 입력 타입 판별 및 SDP 문자열 추출
+            if (typeof input === 'string') {
+                if (input.trim().startsWith('{')) {
+                    // JSON 문자열인 경우
+                    console.info("case1")
+                    const parsed = JSON.parse(input);
+                    sdpString = parsed.sdp || parsed.description || input;
+                } else {
+                    // 순수 SDP 문자열인 경우
+                    console.info("case2")
+                    sdpString = input;
+                }
+            } else if (typeof input === 'object' && input !== null) {
+                // JSON 객체인 경우
+                console.info("case3")
+                sdpString = input.sdp || input.description || "";
+            }
+
+            if (!sdpString) throw new Error("유효한 SDP 문자열을 찾을 수 없습니다.");
+
+            // 2. 크롬/사파리 호환성을 위한 SDP 정규화 (Final Clean)
+            const finalSdp = fixSdpForChrome(sdpString);
+        
+            // 3. 최종 객체 반환
+            return new RTCSessionDescription({
+                type: type,
+                sdp: finalSdp
+            });
+
+        } catch (e) {
+            console.error("SDP 생성 중 에러 발생:", e);
+            return null;
+        }
+    }
+
+    // function waitForIce() {
+    //   return new Promise(resolve => {
+    //     if (pc.iceGatheringState === "complete") {
+    //       resolve();
+    //     } else {
+    //       pc.onicegatheringstatechange = () => {
+    //         if (pc.iceGatheringState === "complete") {
+    //           resolve();
+    //         }
+    //       };
+    //     }
+    //   });
+    // }
+
+    async function monitorRampUp(pc) {
+        if(!pc) return
+        const stats = await pc.getStats();
+        stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.kind === 'video') {
+            console.log(`--- WebRTC 비디오 상태 ---`);
+            console.log(`해상도: ${report.frameWidth}x${report.frameHeight}`);
+            console.log(`초당 프레임(FPS): ${report.framesPerSecond}`);
+            console.log(`누적 수신량: ${(report.bytesReceived / 1024).toFixed(2)} KB`);
+            
+            // 화질 저하 원인 (제한이 걸려있다면 'cpu' 또는 'bandwidth'라고 뜸)
+            if (report.qualityLimitationReason) {
+                console.log(`화질 제한 사유: ${report.qualityLimitationReason}`);
+            }
+            }
+        });
+    }
+
+    // 1초마다 로그 출력
+    setInterval(() => monitorRampUp(pc), 1000);
+  </script>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
